@@ -1,0 +1,290 @@
+model 'visualisation'
+	uses 'mmxprs', 'mmodbc'
+
+	parameters
+		DATAFILE = 'first three periods.xlsx'
+		nodeCount = 9
+		totalTime = 3
+		shipTypeCount = 2
+		pipeTypeCount = 2
+		optCount = 2
+		scenarioCount = integer(optCount^(2 * totalTime))
+	end-parameters
+
+
+	declarations
+
+
+		!Declare different ranges based on the parameters.
+
+		timeSteps =	1..totalTime
+		nodes = 	1..nodeCount
+		shipTypes = 	1..shipTypeCount
+		pipeTypes = 	1..pipeTypeCount
+		captureTypes=	1..2
+
+
+		!Lengths of time steps in years
+
+		length :	array(timeSteps) of real
+
+
+		!Declare variables related to the different scenarios.
+
+		opts = 	1..optCount							!Options for each change of capture amount of a type
+		scenarios= 	1..scenarioCount						!List of all complete scenarios
+		scene : 	array(scenarios, timeSteps, captureTypes) of integer		!The options that happen for types at specific times in a scenario
+		sceneCol:	array(scenarios, timeSteps) of integer			!For each time there are collections of scenarios that are equal up to that time
+		optProb :	array(opts) of real						!Probability of each option
+		optAdd:	array(opts) of real						!How much of the potential addition is added in an option
+		scenProb:	array(scenarios) of real					!Probability of a complete scenario happening
+
+		colNum:	array(timeSteps) of set of integer				!Amount of collections of scenarios that are equal up to time t
+		firstOfCol:	dynamic array(scenarios) of integer				!Representative of scenario collection
+
+
+		!List of the potential increases of the different captureTypes through time
+
+		increase1:	array(nodes, timeSteps) of real
+		increase2:	array(nodes, timeSteps) of real
+		increase:	array(nodes, timeSteps, captureTypes) of real
+
+		!Budgets through time
+
+		capBudget:	array(timeSteps) of real
+		opBudget:	array(timeSteps) of real
+
+		!Ship values
+		shipCapacity:	array(shipTypes) of real
+		shippingCapYear: dynamic array(nodes, nodes, shipTypes) of real
+		shipCapEx:	array(shipTypes) of real
+		shipOpEx:	array(shipTypes) of real
+
+		!Pipe values
+		pipeCapacity:	array(pipeTypes) of real
+		pipeCapEx:	array(pipeTypes) of real
+		pipeOpEx:	array(pipeTypes) of real
+		pipePossible:	dynamic array(nodes, nodes) of real
+		dist:		array(nodes, nodes) of real
+
+		!Node values
+		isSink:	array(nodes) of real
+		sinkCapEx:	array(nodes) of real
+		sinkOpEx:	array(nodes) of real
+
+		co2Cap:	array(timeSteps, nodes, captureTypes, scenarios) of real	!The CO2 capture for the different timesteps, clusters, and capture types based on the scenario.
+
+
+
+
+		co2CaptureUse:array(timeSteps,nodes,captureTypes,scenarios) of mpvar 		!Decision on how much of the captured co2 we use
+
+		pipeBuild:	dynamic array(timeSteps,nodes,nodes,pipeTypes, scenarios) of mpvar 	!Decision on the amount of pipes of a certain type that we build in a timestep and scenario
+		pipeUsage:	dynamic array(timeSteps,nodes,nodes,pipeTypes, scenarios) of mpvar	!Decision on the amount that we use of a collection of pipes of the same type in the same place.
+
+		shipBuild:	array(timeSteps, shipTypes, scenarios) of mpvar			!Decision on the amount of ships of certain types that we buildi in different timesteps
+		shipAllocation:dynamic array(timeSteps, nodes, nodes, shipTypes, scenarios) of mpvar !Decision on the amount of ships that we allocate in certain locations
+		shipUsage:	dynamic array(timeSteps, nodes, nodes, shipTypes, scenarios) of mpvar !Decision on how much co2 is transported with ships in certain locations
+
+		sinkBuild:	array(timeSteps, nodes, scenarios) of mpvar				!Decision on how much co2 capacity we build in certain locations
+		sequestration:array(timeSteps, nodes, scenarios) of mpvar				!Decision on how much is sequestered in locations
+
+
+
+	end-declarations
+
+
+	!Getting the data from the excel file
+
+	initializations from 'mmsheet.xlsx:'+ DATAFILE
+	 [capBudget, opBudget] 				as 'Budget'
+	 [shipCapacity, shipCapEx, shipOpEx] 			as 'ShipTypes'
+	 [pipeCapacity, pipeCapEx, pipeOpEx] 			as 'PipeTypes'
+	 [pipePossible, dist]					as 'Edges'
+	 [isSink, sinkCapEx, sinkOpEx]			as 'Nodes'
+	 [optProb, optAdd]					as 'Prob'
+	 [increase1, increase2]			as 'Increase'
+	end-initializations
+
+
+	!Putting the increase data in a more convenient format
+
+	forall(n in nodes, t in timeSteps) do
+		increase(n,t,1) := increase1(n,t)
+		increase(n,t,2) := increase2(n,t)
+	end-do
+
+
+	!Giving the length of the timesteps in years
+
+	forall(t in 1..(totalTime - 1)) length(t) := 5
+	length(totalTime) := 5
+
+	writeln('done with initializations')
+
+
+	(!
+	Compute what the scenarios actually mean. The scenarios are just integers and we turn them into sequences of realizations of the random variables.
+	To do this we use the binary representation of the number of the scenario. This will give us all the possible scenarios. If there were to be
+	more options than 2, we would use higher base number systems.
+	Also computes the probabilities of these scenarios and puts them into the collections of scenarios that are equal up to some time t.
+	!)
+	forall(scen in scenarios) do
+		pr:= real(1)
+		j:=scen -1
+		forall(t1 in timeSteps) sceneCol(scen,t1) := 1
+		forall(ct in captureTypes, t in timeSteps) do
+			T := (2 * totalTime-((ct-1)*totalTime + t))
+			scene(scen, t, ct) := (j div integer(optCount^T)) + 1
+			forall(t1 in timeSteps | t1>=t) sceneCol(scen,t1) += integer((scene(scen, t, ct) - 1) * optCount^T)
+			pr := pr * optProb(integer(scene(scen,t, ct)))
+			j := j mod integer(optCount^T)
+		end-do
+		scenProb(scen) := pr
+	end-do
+
+
+	!Compute what the scenarios mean for the amount of co2 capture.
+
+	forall(n in nodes, t in timeSteps, ct in captureTypes, scen in scenarios) co2Cap(t, n, ct, scen) := 0
+	forall(ct in captureTypes, scen in scenarios, t1 in timeSteps) do
+		forall(t2 in t1..totalTime, n in nodes) do
+			co2Cap(t2,n,ct,scen) += optAdd(integer(scene(scen,t1,ct))) * increase(n,t1,ct)
+		end-do
+	end-do
+
+
+	!Constraint on the amount of co2 capture that we use by the amount that is available.
+
+	forall(n in nodes, t in timeSteps, scen in scenarios, ct in captureTypes) co2CaptureUse(t,n,ct,scen) <= co2Cap(t, n, ct, scen)
+
+
+	!Create only the decision variables for pipes that are possible, based on the information from the excel sheets.
+
+	forall(t in timeSteps, n1 in nodes, n2 in nodes, p in pipeTypes, scen in scenarios | exists(pipePossible(n1,n2))) do
+		create(pipeBuild(t,n1,n2,p,scen))
+		create(pipeUsage(t,n1,n2,p,scen))
+	end-do
+
+
+	!Constraints that say that the amount of pipes that we build is integer and that the amount of co2 that we transport by pipe is limited by the pipes that we have already built.
+
+	forall(t in timeSteps, n1 in nodes, n2 in nodes, p in pipeTypes, scen in scenarios | exists(pipeBuild(t,n1,n2,p,scen))) pipeBuild(t,n1,n2,p,scen) is_integer
+	forall(t in timeSteps, n1 in nodes, n2 in nodes, p in pipeTypes, scen in scenarios | exists(pipeBuild(t,n1,n2,p,scen))) pipeUsage(t,n1,n2,p,scen) <= sum(t2 in 1..t-1) pipeBuild(t2, n1, n2, p, scen) * pipeCapacity(p)
+
+
+	!Compute the amount of co2 that a ship can transport per year base on the data from the excel sheet.
+
+	forall(n1 in nodes, n2 in nodes, s in shipTypes| dist(n1,n2)<>0) shippingCapYear(n1, n2, s):= (shipCapacity(s)/1000000) * 8322 / (2*dist(n1,n2)/28 + 55)
+
+
+	!Create only the decision variables for ships that are possible, based on the information from the excel sheets.
+
+	forall(t in timeSteps, n1 in nodes, n2 in nodes, s in shipTypes, scen in scenarios | exists(shippingCapYear(n1, n2, s)))do
+		create(shipAllocation(t,n1,n2,s,scen))
+		create(shipUsage(t,n1,n2,s,scen))
+	end-do
+
+
+	!Constraints that say that the amount of ships that we build and use is integer and that the amount of co2 that we transport by ship is limited by the ships that we have already built.
+
+	forall(t in timeSteps, s in shipTypes, scen in scenarios) shipBuild(t,s,scen) is_integer
+	forall(t in timeSteps, n1 in nodes, n2 in nodes, s in shipTypes, scen in scenarios | exists(shipAllocation(t,n1,n2,s,scen))) shipAllocation(t, n1, n2, s, scen) is_integer
+	forall(t in timeSteps, n1 in nodes, n2 in nodes, s in shipTypes, scen in scenarios | exists(shippingCapYear(n1, n2, s))) shipUsage(t,n1,n2,s,scen) <= shipAllocation(t, n1, n2, s, scen) * shippingCapYear(n1, n2, s)
+
+
+	!Constraints that say that the we can only invest in co2 storage in sink locations and we can not sequester more than how much we've already invested in the sinks
+
+	forall(t in timeSteps, n in nodes, scen in scenarios | isSink(n) = 0) sinkBuild(t,n,scen) = 0
+	forall(t in timeSteps, n in nodes, scen in scenarios) length(t)*sequestration(t,n,scen) <= sum(t1 in 1..(t-1)) (sinkBuild(t1,n,scen) - length(t1)*sequestration(t1,n,scen))
+
+
+	!Main transport constraint which says that the amount of co2 that comes into a node is equal to the amount that goes out of it. It includes the capture and sequestration.
+
+	forall(n1 in nodes, t1 in timeSteps, scen in scenarios) sum(n2 in nodes, p in pipeTypes | exists(pipeUsage(t1,n2,n1,p,scen))) pipeUsage(t1,n2,n1,p,scen) - sum(n2 in nodes, p in pipeTypes | exists(pipeUsage(t1,n1,n2,p,scen))) pipeUsage(t1,n1,n2,p,scen) + sum(ct in captureTypes) co2CaptureUse(t1, n1, ct,scen) + sum(n2 in nodes, s in shipTypes | exists(shipUsage(t1,n2,n1,s,scen))) shipUsage(t1, n2, n1, s, scen) - sum(n2 in nodes, s in shipTypes | exists(shipUsage(t1,n1,n2,s,scen))) shipUsage(t1, n1, n2, s, scen) = sequestration(t1, n1, scen)
+
+
+	!The amount of ships that we allocate is equal to the amount of ships that we have already been built.
+
+	forall(t in timeSteps, sh in shipTypes, scen in scenarios) sum(n1 in nodes, n2 in nodes| exists(shipAllocation(t,n1,n2,sh,scen))) shipAllocation(t, n1, n2, sh, scen) = sum(s in 1..(t-1)) shipBuild(s, sh, scen)
+
+
+	!Compute the capex and opex
+
+	forall(t in timeSteps, scen in scenarios) capEx(t, scen) := sum(n1 in nodes, n2 in nodes, p in pipeTypes| exists(pipeBuild(t,n1,n2,p,scen))) pipeCapEx(p) * dist(n1, n2) * pipeBuild(t, n1, n2, p, scen) +  sum(sh in shipTypes) shipBuild(t, sh, scen) * shipCapEx(sh) + sum(n in nodes) sinkBuild(t,n,scen) * sinkCapEx(n)
+
+	forall(t in timeSteps, scen in scenarios) opEx(t, scen) := length(t) * ( sum(n1 in nodes, n2 in nodes, p in pipeTypes | exists(pipeUsage(t,n1,n2,p,scen))) pipeOpEx(p) * dist(n1, n2) * pipeUsage(t, n1, n2, p, scen)  +  sum(n1 in nodes, n2 in nodes, sh in shipTypes|exists(shippingCapYear(n1, n2, sh))) shipUsage(t, n1, n2, sh, scen) * shipOpEx(sh) / shippingCapYear(n1, n2, sh) + sum(n in nodes)length(t)*sequestration(t,n,scen) * sinkOpEx(n))
+
+
+	!Both capex and opex are constrained by the budget
+
+	forall(t in timeSteps, scen in scenarios) opEx(t, scen) <= opBudget(t)
+	forall(t in timeSteps, scen in scenarios) capEx(t, scen) <= capBudget(t)
+
+
+	!Get one representative for each collection.
+
+	forall(scen in scenarios, t in timeSteps | sceneCol(scen,t) not in colNum(t)) do
+		colNum(t) := colNum(t) + {sceneCol(scen,t)}
+		firstOfCol(sceneCol(scen,t)) := scen
+	end-do
+
+
+	!Set decisions in each timestep equal to the representative of the collection that the scenario is in for that timestep
+
+	forall(scen1 in scenarios, t in timeSteps) do
+		scen2 := firstOfCol(sceneCol(scen1,t))
+
+		forall(n in nodes, ct in captureTypes) co2CaptureUse(t,n,ct,scen1) = co2CaptureUse(t,n,ct,scen2)
+
+		forall(n1 in nodes, n2 in nodes, p in pipeTypes| exists(pipeBuild(t,n1,n2,p,scen1))) pipeBuild(t,n1,n2,p,scen1)=pipeBuild(t,n1,n2,p,scen2)
+		forall(n1 in nodes, n2 in nodes, p in pipeTypes| exists(pipeUsage(t,n1,n2,p,scen1))) pipeUsage(t,n1,n2,p,scen1)=pipeUsage(t,n1,n2,p,scen2)
+
+		forall(st in shipTypes) shipBuild(t,st,scen1) = shipBuild(t,st,scen2)
+		forall(n1 in nodes, n2 in nodes, st in shipTypes| exists(shipAllocation(t,n1,n2,st,scen1))) shipAllocation(t, n1,n2,st,scen1) = shipAllocation(t, n1,n2,st,scen2)
+		forall(n1 in nodes, n2 in nodes, s in shipTypes | exists(shipUsage(t,n1,n2,s,scen1))) shipUsage(t,n1,n2,s,scen1) = shipUsage(t,n1,n2,s,scen2)
+
+		forall(n in nodes) sequestration(t,n,scen1) = sequestration(t,n,scen2)
+	end-do
+
+
+	!Compute amount that is sequestered.
+
+	expectedTotal := sum(t in timeSteps, n in nodes, scen in scenarios) scenProb(scen) * sequestration(t, n, scen) * length(t)
+
+	writeln('begin solving')
+
+
+	!Maximize the sequestered amount of co2
+
+
+	maximize(expectedTotal)
+	writeln("solution:\n Objective: ", getobjval)
+
+
+	!Compute values that are needed for the visualisation
+
+	forall(t in timeSteps, sq in nodes | isSink(sq) = 1) avgSeq(t,sq) := sum(scen in scenarios) scenProb(scen) * sequestration(t,sq,scen)
+	forall(t in timeSteps, cl in nodes | isSink(cl) = 0) avgCap(t,cl) := sum(ct in captureTypes, scen in scenarios) scenProb(scen) * co2CaptureUse(t,cl,ct,scen)
+	forall(t in timeSteps, n1 in nodes, n2 in nodes) avgPipe(t,n1,n2) := sum(pt in pipeTypes, scen in scenarios|exists(pipeUsage(t,n1,n2,pt,scen))) scenProb(scen) * pipeUsage(t,n1,n2,pt,scen)
+	forall(t in timeSteps, n1 in nodes, n2 in nodes) avgShip(t,n1,n2) := sum(st in shipTypes, scen in scenarios|exists(shipUsage(t,n1,n2,st,scen))) scenProb(scen) * shipUsage(t,n1,n2,st,scen)
+
+
+	!Get the solution values for those variables
+
+	forall(t in timeSteps, sq in nodes | isSink(sq) = 1 and getsol(avgSeq(t,sq))<>0) SOLavgSeq(t,sq) := getsol(avgSeq(t,sq))
+	forall(t in timeSteps, cl in nodes | isSink(cl) = 0 and getsol(avgCap(t,cl))<>0) SOLavgCap(t,cl) := getsol(avgCap(t,cl))
+	forall(t in timeSteps, n1 in nodes, n2 in nodes| getsol(avgPipe(t,n1,n2))<>0) SOLavgPipe(t,n1,n2) := getsol(avgPipe(t,n1,n2))
+	forall(t in timeSteps, n1 in nodes, n2 in nodes| getsol(avgShip(t,n1,n2))<>0) SOLavgShip(t,n1,n2) := getsol(avgShip(t,n1,n2))
+
+
+	!Output the desired variables into the excel file
+
+	initializations to 'mmsheet.xlsx:'+ DATAFILE
+		SOLavgSeq as "avgSeq"
+		SOLavgCap as "avgCap"
+		SOLavgPipe as "avgPipe"
+		SOLavgShip as "avgShip"
+	end-initializations
+
+end-model
